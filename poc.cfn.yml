@@ -1,0 +1,627 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+# Any code, applications, scripts, templates, proofs of concept,
+# documentation and other items are provided for illustration purposes only.
+
+Description: Data Ingestion Serverless Processing
+
+
+Parameters:
+
+  DbUsername:
+    Description: Database master username
+    Type: String
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: "^[a-zA-Z]+[0-9a-zA-Z_]*$"
+    ConstraintDescription: Must start with a letter. Only numbers, letters, and _ accepted. max length 16 characters
+
+  KinesisDataStreamShardCount:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 650 # Soft limit - requires increase request
+
+  KinesisDataStreamRetentionHours:
+    Type: Number
+    Default: 24
+    MinValue: 24
+    MaxValue: 168
+    ConstraintDescription: Period in hours must be between 24 and 168
+
+  KinesisDataStreamBufferIntervalInSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    ConstraintDescription: Period in seconds must be between 60 and 900
+
+  KinesisDataStreamBufferSizeInMBs:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 128
+    ConstraintDescription: Period in seconds must be between 1 and 128
+
+  EnvName:
+    Type: String
+    Description: The environment name
+    Default: dev
+
+  VpcId:
+    Type: String
+    Description: The vpc id
+
+  SubnetId0:
+    Type: String
+    Description: The subnet id
+
+  SubnetId1:
+    Type: String
+    Description: The subnet id
+
+  Az0:
+    Type: String
+    Description: The availability zone
+    Default: us-east-1d
+
+  Az1:
+    Type: String
+    Description: The availability zone
+    Default: us-east-1c
+
+  CertificateArn:
+    Type: String
+    Description: The SSL/TLS certificate ARN
+    MinLength: 0
+    MaxLength: 2048
+    Default: ""
+
+  DomainName:
+    Type: String
+    Description: Domain name for the API Gateway
+    Default: ""
+    AllowedPattern: "(^$|^((?!-)[A-Za-z0-9-]{1,63}(?<!-)\\.)+[A-Za-z]{2,6}$)" # Allow for a blank or a domain name
+    ConstraintDescription: Please enter a valid domain name
+
+  HostedZoneName:
+    Type: String
+    Description: The Amazon Route 53 Hosted Zone Name for the optional load balancer alias record - do not include a period at the end
+    Default: ""
+    AllowedPattern: "(^$|^((?!-)[A-Za-z0-9-]{1,63}(?<!-)\\.)+[A-Za-z]{2,6}$)" # Allow for a blank or a domain name
+    ConstraintDescription: Please enter a valid Route 53 Hosted Zone Name
+
+
+Conditions:
+
+  IsCustomHostnameTlsEnabled: !And
+    - !Not [ !Equals [ !Ref CertificateArn, "" ] ]
+    - !Not [ !Equals [ !Ref DomainName, "" ] ]
+    - !Not [ !Equals [ !Ref HostedZoneName, "" ] ]
+
+
+Resources:
+
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub data-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  DbKmsCustomerManagedKey:
+    Type: AWS::KMS::Key
+    Properties:
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:CreateGrant
+              - kms:ListGrants
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+                kms:ViaService: !Sub rds.${AWS::Region}.amazonaws.com
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref AWS::StackName
+      KmsKeyId: !Ref DbKmsCustomerManagedKey
+      GenerateSecretString:
+        SecretStringTemplate: !Join ['', ['{"username": "', !Ref DbUsername, '"}'] ]
+        GenerateStringKey: "password"
+        ExcludeCharacters: '"@/\'
+        PasswordLength: 16
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  SecretDbClusterAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref DbCluster
+      TargetType: AWS::RDS::DBCluster
+
+  LambdaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub lambda-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  DbProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: !Ref AWS::StackName
+      EngineFamily: POSTGRESQL
+      IdleClientTimeout: 120
+      DebugLogging: true
+      RoleArn: !GetAtt DbProxyRole.Arn
+      VpcSecurityGroupIds:
+        - !GetAtt DbProxySecurityGroup.GroupId
+      VpcSubnetIds:
+        - !Ref SubnetId0
+        - !Ref SubnetId1
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref DbSecret
+          IAMAuth: DISABLED
+      RequireTLS: true
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  DbProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      TargetGroupName: default  # default was created when service was released
+      DBProxyName: !Ref DbProxy
+      DBClusterIdentifiers:
+        - !Ref DbCluster
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: 100
+        MaxIdleConnectionsPercent: 50
+        ConnectionBorrowTimeout: 120 # adjust for long running applications/transactions
+    DependsOn:
+      - DbCluster
+      - DbInstance00
+      - DbInstance01
+
+  DbProxyEndpoint:
+    Type: AWS::RDS::DBProxyEndpoint
+    Properties:
+      DBProxyEndpointName: !Ref AWS::StackName
+      DBProxyName: !Ref DbProxy
+      TargetRole: READ_WRITE
+      VpcSubnetIds:
+        - !Ref SubnetId0
+        - !Ref SubnetId1
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Ref AWS::StackName
+      DBSubnetGroupDescription: Db Group
+      SubnetIds:
+        - !Ref SubnetId0
+        - !Ref SubnetId1
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: !Ref AWS::StackName
+      DatabaseName: application
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref DbSecret, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref DbSecret, ':SecretString:password}}' ]]
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      Engine: aurora-postgresql
+      Port: 5432
+      EngineVersion: 11.9
+      DBClusterParameterGroupName: default.aurora-postgresql11
+      StorageEncrypted: true
+      EnableIAMDatabaseAuthentication: true
+      CopyTagsToSnapshot: true
+      KmsKeyId: !Ref DbKmsCustomerManagedKey
+      EnableCloudwatchLogsExports:
+        - postgresql
+      VpcSecurityGroupIds:
+        - !Ref DbSecurityGroup
+      AvailabilityZones:
+        - !Ref Az0
+        - !Ref Az1
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  DbInstance00:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub ${AWS::StackName}-00
+      Engine: aurora-postgresql
+      DBClusterIdentifier: !Ref DbCluster
+      PubliclyAccessible: true
+      DBInstanceClass: db.r6g.large
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref DbKmsCustomerManagedKey
+      PerformanceInsightsRetentionPeriod: 7
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  DbInstance01:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub ${AWS::StackName}-01
+      Engine: aurora-postgresql
+      DBClusterIdentifier: !Ref DbCluster
+      PubliclyAccessible: true
+      DBInstanceClass: db.r6g.large
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref DbKmsCustomerManagedKey
+      PerformanceInsightsRetentionPeriod: 7
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora Security Group
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-DbSecurityGroup
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda Security Group
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-LambdaSecurityGroup
+
+  DbProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DB Proxy Security Group
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-DbProxySecurityGroup
+
+  LambdaSecurityGroupToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt LambdaSecurityGroup.GroupId
+      IpProtocol: tcp
+      ToPort: 5432
+      FromPort: 5432
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+
+  LambdaSecurityGroupToDbProxyEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt LambdaSecurityGroup.GroupId
+      IpProtocol: tcp
+      ToPort: 5432
+      FromPort: 5432
+      DestinationSecurityGroupId: !Ref DbProxySecurityGroup
+
+  DbProxySecurityGroupToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt DbProxySecurityGroup.GroupId
+      IpProtocol: tcp
+      ToPort: 5432
+      FromPort: 5432
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+
+  # This is required so that that the proxy can talk to secrets manager
+  # If you have a vpc endpoint for sm, you could tighten this up
+  DbProxySecurityGroupToHttpsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt DbProxySecurityGroup.GroupId
+      IpProtocol: tcp
+      ToPort: 443
+      FromPort: 443
+      CidrIp: 0.0.0.0/0
+
+  DbSecurityGroupFromLambaIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DbSecurityGroup.GroupId
+      IpProtocol: tcp
+      ToPort: 5432
+      FromPort: 5432
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  DbSecurityGroupFromDbProxyIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DbSecurityGroup.GroupId
+      IpProtocol: tcp
+      ToPort: 5432
+      FromPort: 5432
+      SourceSecurityGroupId: !Ref DbProxySecurityGroup
+
+  DbProxySecurityGroupFromLambaIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DbProxySecurityGroup.GroupId
+      IpProtocol: tcp
+      ToPort: 5432
+      FromPort: 5432
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /poc/${AWS::StackName}
+      RetentionInDays: 60
+
+  KinesisDataFirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref LogGroup
+      LogStreamName: kinesis-data-firehose
+
+        #            Condition:
+        #      StringEquals:
+        #        sts:ExternalId: !Ref AWS::AccountId
+
+  DbProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: rds-proxy-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Resource: !Ref DbSecret
+                Action:
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:ListSecretVersionIds
+              - Effect: Allow
+                Resource: !GetAtt DbKmsCustomerManagedKey.Arn
+                Action: kms:Decrypt
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub secretsmanager.${AWS::Region}.amazonaws.com
+
+  KinesisDataFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: firehose-role
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${Bucket}
+                  - !Sub arn:aws:s3:::${Bucket}/*
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+              - Effect: Allow
+                Resource: !GetAtt KinesisDataStream.Arn
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+              - Effect: Allow
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroup}:log-stream:${KinesisDataFirehoseLogStream}
+                Action: logs:PutLogEvents
+
+  KinesisDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Ref AWS::StackName
+      ShardCount: !Ref KinesisDataStreamShardCount
+      RetentionPeriodHours: !Ref KinesisDataStreamRetentionHours
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  KinesisDataFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt KinesisDataStream.Arn
+        RoleARN: !GetAtt KinesisDataFirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        Prefix: !Sub ${EnvName}/
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref LogGroup
+          LogStreamName: !Ref KinesisDataFirehoseLogStream
+        BucketARN: !GetAtt Bucket.Arn
+        BufferingHints:
+          IntervalInSeconds: !Ref KinesisDataStreamBufferIntervalInSeconds
+          SizeInMBs: !Ref KinesisDataStreamBufferSizeInMBs
+        CompressionFormat: GZIP
+        RoleARN: !GetAtt KinesisDataFirehoseRole.Arn
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Ref AWS::StackName
+      ProtocolType: HTTP
+      Tags:
+        EnvName: !Ref EnvName
+
+  ApiDomainName:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: IsCustomHostnameTlsEnabled
+    Properties:
+      DomainName: !Ref DomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref CertificateArn
+          SecurityPolicy:  TLS_1_2
+      Tags:
+        EnvName: !Ref EnvName
+
+  Route53Record:
+    Type: AWS::Route53::RecordSet
+    Condition: IsCustomHostnameTlsEnabled
+    Properties:
+      HostedZoneName: !Sub ${HostedZoneName}.
+      Name: !Sub ${DomainName}.
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApiDomainName.RegionalDomainName
+        HostedZoneId: !GetAtt ApiDomainName.RegionalHostedZoneId
+
+  ApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: IsCustomHostnameTlsEnabled
+    Properties:
+      DomainName: !Ref DomainName
+      ApiId: !Ref Api
+      Stage: !Ref ApiDefaultStage
+
+  ApiDefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: '$default'
+      ApiId: !Ref Api
+      AutoDeploy: true
+      Tags:
+        EnvName: !Ref EnvName
+
+  KdsApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      RouteKey: ANY /kds
+      ApiId: !Ref Api
+      AuthorizationType: NONE
+      Target: !Sub integrations/${ApiKdsIntegration}
+
+  ApiKdsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      ConnectionType: INTERNET
+      PayloadFormatVersion: 1.0
+      IntegrationSubtype: Kinesis-PutRecord
+      TimeoutInMillis: 30000
+      CredentialsArn: !GetAtt ApiGatewayProxyKinesisPutRecordsRole.Arn
+      RequestParameters:
+        PartitionKey: '$request.body.PartitionKey'
+        Data: '$request.body.Data'
+        StreamName: !Ref KinesisDataStream
+
+  ApiGatewayProxyKinesisPutRecordsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: apig-kinesis-put-record
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: kinesis:PutRecord
+                Resource: !GetAtt KinesisDataStream.Arn
+
+
+Outputs:
+
+  KinesisDataStreamArn:
+    Value: !GetAtt KinesisDataStream.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-KinesisDataStreamArn
+
+  ApiId:
+    Value: !Ref Api
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiId
+
