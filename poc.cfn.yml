@@ -413,10 +413,6 @@ Resources:
       LogGroupName: !Ref LogGroup
       LogStreamName: kinesis-data-firehose
 
-        #            Condition:
-        #      StringEquals:
-        #        sts:ExternalId: !Ref AWS::AccountId
-
   DbProxyRole:
     Type: AWS::IAM::Role
     Properties:
@@ -477,7 +473,7 @@ Resources:
                   - s3:ListBucketMultipartUploads
                   - s3:PutObject
               - Effect: Allow
-                Resource: !GetAtt KinesisDataStream.Arn
+                Resource: !GetAtt StorageKinesisDataStream.Arn
                 Action:
                   - kinesis:DescribeStream
                   - kinesis:GetShardIterator
@@ -486,10 +482,23 @@ Resources:
                 Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroup}:log-stream:${KinesisDataFirehoseLogStream}
                 Action: logs:PutLogEvents
 
-  KinesisDataStream:
+  ReceiveKinesisDataStream:
     Type: AWS::Kinesis::Stream
     Properties:
-      Name: !Ref AWS::StackName
+      Name: !Sub receive-${AWS::StackName}
+      ShardCount: !Ref KinesisDataStreamShardCount
+      RetentionPeriodHours: !Ref KinesisDataStreamRetentionHours
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: EnvName
+          Value: !Ref EnvName
+
+  StorageKinesisDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub storage-${AWS::StackName}
       ShardCount: !Ref KinesisDataStreamShardCount
       RetentionPeriodHours: !Ref KinesisDataStreamRetentionHours
       StreamEncryption:
@@ -504,7 +513,7 @@ Resources:
     Properties:
       DeliveryStreamType: KinesisStreamAsSource
       KinesisStreamSourceConfiguration:
-        KinesisStreamARN: !GetAtt KinesisDataStream.Arn
+        KinesisStreamARN: !GetAtt StorageKinesisDataStream.Arn
         RoleARN: !GetAtt KinesisDataFirehoseRole.Arn
       ExtendedS3DestinationConfiguration:
         Prefix: !Sub ${EnvName}/
@@ -590,7 +599,7 @@ Resources:
       RequestParameters:
         PartitionKey: '$request.body.PartitionKey'
         Data: '$request.body.Data'
-        StreamName: !Ref KinesisDataStream
+        StreamName: !Ref ReceiveKinesisDataStream
 
   ApiGatewayProxyKinesisPutRecordsRole:
     Type: AWS::IAM::Role
@@ -610,15 +619,15 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: kinesis:PutRecord
-                Resource: !GetAtt KinesisDataStream.Arn
+                Resource: !GetAtt ReceiveKinesisDataStream.Arn
 
 
 Outputs:
 
-  KinesisDataStreamArn:
-    Value: !GetAtt KinesisDataStream.Arn
+  ReceiveKinesisDataStreamArn:
+    Value: !GetAtt ReceiveKinesisDataStream.Arn
     Export:
-      Name: !Sub ${AWS::StackName}-KinesisDataStreamArn
+      Name: !Sub ${AWS::StackName}-ReceiveKinesisDataStream
 
   ApiId:
     Value: !Ref Api
